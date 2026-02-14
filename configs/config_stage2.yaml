@@ -1,0 +1,51 @@
+# config_stage2.yaml - Stage2: Fusion Warmup
+dataset:
+  # 5-fold cross validation data directory
+  # Each fold should contain: train_pair.csv, val_pair.csv
+  kfold_base_dir: Data/Data_all_AD/New-split/Splits_cv5
+  scales: [100,200,300,400,500]
+  layers: 5
+  num_class: 2
+
+training:
+  # ===== Stage1 checkpoint paths =====
+  # Load single-modal branch from Stage1 best checkpoint
+  # These paths will be automatically resolved based on fold during cross-validation
+  stage1:
+    # Relative path to Stage1 results directory
+    stage1_result_dir: "results/Stage1"
+    # Model file names (will be combined with fold paths)
+    best_fmri_ckpt_name: "bestmodel/best_model_fmri_fold{fold}.pth"
+    best_eeg_ckpt_name: "bestmodel/best_model_eeg_fold{fold}.pth"
+  
+  # ===== Task and fusion =====
+  fusion_mode: "bcmf"  # Bidirectional Cross-Modal Fusion (formerly "dual_cross")
+  use_msre: true  # Stage2 enables MSRE
+  use_corr_align: False      # Whether to enable correlation alignment
+  corr_align_dim: 16        # Alignment projection dimension (default 16)
+  corr_align_lambda: 0.1    # Correlation alignment loss weight (default 0.1)  
+
+  # ===== Training hyperparameters =====
+  batch_size: 30
+  fusion_warmup_epochs: 50  # Stage2 epochs (corresponding to fusion_warmup_epochs)
+  lr: 0.001
+  weight_decay: 0.01
+  num_workers: 4
+  eval_interval_fusion_warmup: 5  # Validate every epoch in fusion warmup stage
+  
+  # ===== Class imbalance and sampling =====
+  imbalance_loss: true
+  
+  # ===== MSRE module =====
+  msre_lambda: 1.0
+  msre_reg_lambda: 0.1
+  
+  # ===== Model saving =====
+  min_epochs_before_saving: 10
+  select_metric: "auc"  # Metric for selecting best model
+  use_tqdm: true
+
+logging:
+  result_dir: "results/Stage2"
+  tensorboard: true
+

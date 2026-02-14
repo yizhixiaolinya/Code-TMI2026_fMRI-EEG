@@ -1,0 +1,76 @@
+# config_stage3.yaml - Stage3: Post-Fusion
+dataset:
+  # 5-fold cross validation data directory
+  # Each fold should contain: train_all.csv, val_all.csv
+  kfold_base_dir: Data/Data_all_AD/New-split/Splits_cv5
+  scales: [100,200,300,400,500]
+  layers: 5
+  num_class: 2
+
+training:
+  # ===== Stage1 checkpoint paths (optional, as backup) =====
+  # Although Stage2 checkpoint should contain complete model weights, loading Stage1 can be a backup
+  stage1:
+    # Relative path to Stage1 results directory
+    stage1_result_dir: "results/Stage1"
+    # Model file names (will be combined with fold paths)
+    best_fmri_ckpt_name: "bestmodel/best_model_fmri_fold{fold}.pth"
+    best_eeg_ckpt_name: "bestmodel/best_model_eeg_fold{fold}.pth"
+  
+  # ===== Stage2 checkpoint paths =====
+  # Load complete model from Stage2 best fusion checkpoint
+  # Note: Stage2 checkpoint should contain complete model weights (fmri_net + eeg_net + fuser)
+  # If Stage2 checkpoint is complete, it will override Stage1 weights
+  stage2:
+    # Relative path to Stage2 results directory
+    stage2_result_dir: "results/Stage2"
+    # Model file name (will be combined with fold paths)
+    best_fusion_ckpt_name: "bestmodel/best_model_fusion_fold{fold}.pth"
+
+  
+  # ===== Task and fusion =====
+  fusion_mode: "bcmf"  # Bidirectional Cross-Modal Fusion (formerly "dual_cross")
+  use_msre: true  # Stage3 enables MSRE
+  use_corr_align: False      # Whether to enable correlation alignment (default true)
+  corr_align_dim: 16        # Alignment projection dimension (default 16)
+  corr_align_lambda: 0.1    # Correlation alignment loss weight (default 0.1)
+  freeze_fusion: true       # Whether to freeze fusion module and fusion classification head (default true)
+  use_balanced_sampling: true  # Whether to use balanced sampling (1:1:1 ratio, default true)  
+  
+  # ===== Training hyperparameters =====
+  batch_size: 30
+  post_epochs: 60  # Stage3 epochs (post stage)
+  lr: 0.0001
+  weight_decay: 0.01
+  num_workers: 4
+  eval_interval: 5
+  
+  # ===== Class imbalance and sampling =====
+  imbalance_loss: true
+  
+  # ===== Alignment loss scheduling =====
+  eta: 0.5              # Align loss weight (paper symbol η)
+  eta_ramp_epochs: 20   # Linear ramp epochs for η
+  
+  # ===== Allowed modalities =====
+  after_allow_modes: ["fmri_only", "eeg_only", "both"]
+  eeg_only_loss_weight: 2
+  fmri_only_loss_weight: 1
+  
+  # ===== MSRE module =====
+  msre_lambda: 1.0
+  msre_reg_lambda: 0.1
+  
+  # ===== Early stopping =====
+  early_stop_on_drop: false
+  early_stop_patience: 5
+  
+  # ===== Model saving =====
+  min_epochs_before_saving: 10
+  select_metric: "auc"  # Metric for selecting best model
+  use_tqdm: true
+
+logging:
+  result_dir: "results/Stage3"
+  tensorboard: true
+

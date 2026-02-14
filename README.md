@@ -1,15 +1,15 @@
-# FUSE-AD: Multi-modal Fusion Framework for Alzheimer's Disease Diagnosis
+# FE-KTNet: Cross-modality Knowledge Transfer Between fMRI and EEG for Improved Single-modality Alzheimer’s Disease Diagnosis
 
-FUSE-AD is a hierarchical multi-modal fusion framework for Alzheimer's Disease (AD) diagnosis that combines functional Magnetic Resonance Imaging (fMRI) and Electroencephalography (EEG) data.
+FE-KTNet is a hierarchical multi-modal fusion framework for Alzheimer's Disease (AD) diagnosis that combines functional Magnetic Resonance Imaging (fMRI) and Electroencephalography (EEG) data.
 
 ## Key Features
 
 - **Hierarchical Graph Attention Architecture (HGAA)**: Processes brain connectivity networks at multiple ROI scales (100-500 ROIs) with fine-to-coarse pooling
 - **Bidirectional Cross-Modal Fusion (BCMF)**: Scale-wise bidirectional cross-attention mechanism for effective cross-modal integration
 - **Three-Stage Progressive Training**:
-  - **Stage 1**: Single-modal (independent fMRI/EEG encoder training)
-  - **Stage 2**: Fusion (train fusion module with frozen encoders, paired data only)
-  - **Stage 3**: Multiscale modality-specific alignment (teacher-student distillation with scale-wise L2 alignment)
+  - **Stage 1**: Hierarchical modality-specific encoding (independent fMRI/EEG training)
+  - **Stage 2**: Bidirectional cross-modality fusion (BCMF, paired data only)
+  - **Stage 3**: Alignment-based multiscale knowledge transfer (freeze fusion, align single-modal to fused teacher)
 - **Scale-wise Graph Embeddings**: Fixed-dimension graph-level representations `[B, d]` for each scale, derived from node-level features via global average pooling
 - **Missing Modality Handling**: Seamlessly handles fMRI-only, EEG-only, and paired samples
 - **5-Fold Cross-Validation**: Subject-level strict separation for reliable evaluation
@@ -18,25 +18,38 @@ FUSE-AD is a hierarchical multi-modal fusion framework for Alzheimer's Disease (
 
 ![Code Framework](Code_framework.png)
 
-## Architecture
+The framework consists of three progressive training stages:
 
-### Hierarchical Graph Attention Architecture (HGAA)
-- **Input**: Multi-scale adjacency matrices `[B, R_s, R_s]` where `R_s` varies by scale (100, 200, 300, 400, 500)
-- **Processing**: Fine-to-coarse pooling with GCN layers and optional self-attention
-- **Output**: 
-  - Node-level features: `[B, R_s, d]` where `d=64` (fixed hidden dimension)
-  - Graph-level embeddings: `[B, d]` per scale via global average pooling
+### (A) Stage 1: Hierarchical Modality-specific Encoding
+Each modality (fMRI and EEG) is independently encoded using Hierarchical Graph Attention Aggregation (HGAA) across multiple scales (s ∈ {1, 2, ..., 5}). 
 
-### Bidirectional Cross-Modal Fusion (BCMF)
-- **Input**: Node-level features from fMRI and EEG encoders `[B, R_s, d]`
-- **Process**: Shared similarity matrix computation, bidirectional cross-attention, and feature refinement
-- **Output**: Fused graph embeddings `g^{fuse}_s \in \mathbb{R}^{B \times d}` per scale
-- **Mixing**: Learnable scale-specific coefficients `λ_s` for weighted fusion in `learnable_mix` mode
+- **Input**: Multi-scale connectivity matrices where ROI count varies by scale (100, 200, 300, 400, 500 nodes)
+- **Architecture**: 
+  - **Multichannel GCN Propagation** (right side): Processes multi-frequency EEG bands
+  - **Band-preserving Global Self-attention**: Captures long-range dependencies while preserving frequency band structure
+  - **Adaptive Fine-to-Coarse Pooling**: Hierarchically aggregates information across scales
+- **Output**: Graph-level embeddings `(A_s^f, μ_s^f)` for fMRI and `(A_s^e, μ_s^e)` for EEG at each scale s
 
-### Stage 3 Alignment
-- **Objective**: Align single-modal graph embeddings `g^m_s` with fused teacher embeddings `g^{fuse}_s`
-- **Loss**: `L_{align}^m = \sum_s \|g^m_s - g^{fuse}_s\|_2^2` where `m \in \{f, e\}`
-- **Scope**: Only computed on paired batches
+### (B) Stage 2: Bidirectional Cross-modality Fusion (BCMF)
+Loads pre-trained encoders from Stage 1 and trains the fusion module on paired samples.
+
+- **Alignment losses** `L_{align}^f` and `L_{align}^e` ensure modality-specific features are compatible
+- **Cross-attention mechanism**: Bidirectional information exchange between fMRI and EEG features
+- **Scale-wise fusion**: Integrates features at each hierarchical scale before final readout
+- **Output**: Fused representations that combine complementary information from both modalities
+
+### (C) Stage 3: Alignment-based Multiscale Knowledge Transfer
+Freezes the fusion module (teacher) and fine-tunes single-modal encoders (students) with alignment loss.
+
+- **Teacher model**: Stage 2 fusion module with frozen weights generates target embeddings `(A_s^f, μ_s^f)`
+- **Student models**: Single-modal encoders trained to mimic fused representations
+- **Scale-wise L2 alignment**: 
+  ```
+  L_{align} = Σ_s [||g_s^f - g_s^{fuse}||_2^2 + ||g_s^e - g_s^{fuse}||_2^2]
+  ```
+  where alignment occurs at every scale s (denoted by yellow "L_align" annotations)
+- **Total loss**: `L = L_CE + η·L_{align}` where η (eta) controls alignment strength
+- **Benefit**: Single-modal branches learn to produce fusion-quality features, enabling robust inference even when only one modality is available
 
 ## Installation
 
@@ -73,7 +86,7 @@ python Training_stage1.py --config configs/config_stage1.yaml --save_path result
 ```
 
 ### Stage 2: Fusion Warmup
-Load Stage 1 checkpoints and train fusion module (frozen encoders, paired data only):
+Load Stage 1 checkpoints and train all modules together (encoders + fusion, paired data only):
 ```bash
 python Training_stage2.py --config configs/config_stage2.yaml --save_path results/Stage2
 ```
@@ -91,7 +104,8 @@ Key parameters in `configs/config_*.yaml`:
 - `use_msre`: Enable Modality-Specific Reliability Estimator (optional)
 - `use_corr_align`: Enable correlation alignment before fusion (optional)
 - `fusion_mode`: `"bcmf"`, `"learnable_mix"`, or `"concat_only"`
-- `freeze_fusion`: Freeze fusion module in Stage 3 (default: true)
+- `freeze_fusion`: Freeze fusion module (Stage 2 BCMF/fuser) in Stage 3 (default: true). When true, only single-modal branches are trained; fusion weights from Stage 2 are frozen as teacher.
+- `eta`: Alignment loss weight η in Stage 3 (default: 0.5). Total loss = L_CE + η·L_align. Supports `eta_ramp_epochs` for linear warmup.
 
 ## Results
 
