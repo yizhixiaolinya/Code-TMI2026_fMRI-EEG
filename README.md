@@ -1,5 +1,10 @@
 # FE-KTNet: fMRI-EEG Knowledge Transfer Network
 
+![TMI2026](https://img.shields.io/badge/TMI-2026-blue)
+![MICCAI2026](https://img.shields.io/badge/MICCAI-2026-green)
+
+This repository hosts the shared implementation for our TMI 2026 and MICCAI 2026 fMRI-EEG studies. All code updates are maintained here.
+
 FE-KTNet learns from paired fMRI-EEG data and transfers multimodal knowledge to models that use a single modality at inference.
 
 ![Framework overview](Code_framework.png)
