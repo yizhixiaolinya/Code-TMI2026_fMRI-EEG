@@ -1,20 +1,19 @@
-from sklearn.metrics import balanced_accuracy_score, f1_score, roc_auc_score
-import numpy as np
-import torch
-import torch.nn.functional as F
-from pathlib import Path
+"""Shared data, training, and evaluation helpers for FE-KTNet."""
+import argparse
+import json
 import logging
-import os
-from typing import List, Dict
-from collections import defaultdict
-from sklearn import metrics as M
+from pathlib import Path
 
-# -------------------------
-# Basics: Logging
-# -------------------------
+import numpy as np
+import pandas as pd
+import torch
+import yaml
+from sklearn import metrics as M
+from sklearn.metrics import f1_score, roc_auc_score
+from torch.utils.data import DataLoader
+
+
 def setup_logger(log_path: str):
-    for h in logging.root.handlers[:]:
-        logging.root.removeHandler(h)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
@@ -23,476 +22,240 @@ def setup_logger(log_path: str):
     )
     return logging.getLogger(__name__)
 
-def save_confusion_matrix(cm, save_path, filename="confusion_matrix.txt"):
-    """
-    Save confusion matrix to file
-    
-    Args:
-        cm: Confusion matrix (numpy array or list)
-        save_path: Save directory
-        filename: Filename
-    """
-    _ensure_dir(save_path)
-    filepath = os.path.join(save_path, filename)
-    
-    cm_array = np.array(cm)
-    np.savetxt(filepath, cm_array, fmt='%d', delimiter='\t')
-    
-    # Also save in readable format
-    with open(filepath.replace('.txt', '_readable.txt'), 'w') as f:
-        f.write("Confusion Matrix:\n")
-        f.write("=" * 30 + "\n")
-        for i, row in enumerate(cm_array):
-            f.write(f"Class {i}: {row}\n")
-        f.write("=" * 30 + "\n")
-        f.write(f"Total samples: {cm_array.sum()}\n")
 
-
-# -------------------------
-# Training schedule: alignment loss warmup
-# -------------------------
-class AlignLambdaScheduler:
-    """warm-up phase=0, then linearly ramp up to target in ramp"""
-    def __init__(self, warmup_epochs_single: int, target: float, ramp_epochs: int):
-        self.warmup = int(warmup_epochs_single)
-        self.target = float(target)
-        self.ramp = int(ramp_epochs)
-
-    def __call__(self, epoch: int) -> float:
-        if epoch < self.warmup:
-            return 0.0
-        if self.ramp <= 0:
-            return self.target
-        t = min(1.0, (epoch - self.warmup + 1) / self.ramp)
-        return self.target * t
-
-# -------------------------
-# Data: modality determination/bucketing
-# -------------------------
-def infer_mode_from_row(row):
-    """Unified missing value judgment logic with MultiModalDatasetCSV"""
-    def _has(v):
-        if v is None:
-            return False
-        if not isinstance(v, str):
-            v = str(v)
-        v = v.strip().lower()
-        return not (v in {"", "nan", "none", "null"})
-
-    has_fmri = _has(getattr(row, "fmri_dst", None))
-    has_eeg  = _has(getattr(row, "eeg_dst", None))
-
-    if has_fmri and has_eeg:
-        return "both"
-    elif has_fmri:
-        return "fmri_only"
-    elif has_eeg:
-        return "eeg_only"
-    else:
-        return "none"
-
-def bucket_by_mode(sub_info, indices):
-    buckets = {"fmri_only": [], "eeg_only": [], "both": []}
-    for i in indices:
-        m = infer_mode_from_row(sub_info.iloc[i])
-        if m in buckets:
-            buckets[m].append(i)
-    return {k: np.array(v, dtype=int) for k, v in buckets.items()}
-
-# -------------------------
-# A/E multi-scale packing (index slicing)
-# -------------------------
 def build_A_list(fmri_data, scales, idx=None, device="cpu"):
-    if not fmri_data:
-        return [None] * len(scales)
     out = []
     for s in scales:
-        if s in fmri_data:
-            t = fmri_data[s]
-            t = t[idx] if (idx is not None and len(idx) > 0) else t
-            out.append(t.to(device))
-        else:
-            out.append(None)
+        t = fmri_data[s]
+        out.append((t if idx is None else t[idx]).to(device))
     return out
+
 
 def build_E_list(eeg_data, scales, idx=None, device="cpu"):
-    if not eeg_data:
-        return [None] * len(scales)
     out = []
     for s in scales:
-        if s in eeg_data:
-            band_dict = {}
-            for band, t in eeg_data[s].items():
-                t2 = t[idx] if (idx is not None and len(idx) > 0) else t
-                band_dict[band] = t2.to(device)
-            out.append(band_dict)
-        else:
-            out.append(None)
+        out.append({band: (t if idx is None else t[idx]).to(device)
+                    for band, t in eeg_data[s].items()})
     return out
 
-# -------------------------
-# Evaluation: overall/separate/OOF balanced
-# -------------------------
-def summarize_val(y_true, y_pred, probs, num_class):
-    # Returns: accuracy / bal_acc / macro_f1 / auc / sensitivity / specificity
 
-    y_true = np.asarray(y_true); y_pred = np.asarray(y_pred)
-    probs  = np.asarray(probs) if probs is not None and len(probs) else np.zeros((0, num_class))
-    accuracy = (y_true == y_pred).mean() if len(y_true) else float('nan')
-    bal_acc  = balanced_accuracy_score(y_true, y_pred) if len(y_true) else float('nan')
-    macro_f1 = f1_score(y_true, y_pred, average='macro', zero_division=0) if len(y_true) else float('nan')
-    sens     = M.recall_score(y_true, y_pred, average='macro', zero_division=0) if len(y_true) else float('nan')
-    spec     = sens
-    if len(np.unique(y_true)) > 1 and probs.shape[0] > 0:
-        if probs.ndim == 1:
-            mask = np.isfinite(probs)
+def training_arguments(stage):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default=f"configs/config_stage{stage}.yaml")
+    parser.add_argument("--save_path")
+    parser.add_argument("--task", choices=("AD-NC", "MCI-NC", "AD-MCI"))
+    parser.add_argument("--fold", type=int, choices=range(5))
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--smoke-steps", type=int, default=0,
+                        help="Bounded verification only; uses a small subject subset and one epoch.")
+    parser.add_argument("--eval-only", action="store_true",
+                        help="Evaluate saved best checkpoints without training.")
+    args = parser.parse_args()
+    with open(args.config) as handle:
+        config = yaml.safe_load(handle)
+    if args.task is not None:
+        config["dataset"]["task"] = args.task
+    if args.fold is not None:
+        config["dataset"]["fold"] = args.fold
+    config["runtime"] = dict(device=args.device, smoke_steps=args.smoke_steps,
+                             eval_only=args.eval_only)
+    return config, args.save_path or config["logging"]["result_dir"]
+
+
+def selected_folds(config):
+    fold = config["dataset"]["fold"]
+    return range(5) if fold is None else [int(fold)]
+
+
+def run_directory(root, task, fold):
+    return Path(root) / task / f"fold{fold}"
+
+
+def best_checkpoint(root, task, fold, modality):
+    return run_directory(root, task, fold) / "bestmodel" / f"best_model_{modality}_fold{fold}.pth"
+
+
+def read_split(config, fold, split, mode):
+    directory = Path(config["dataset"]["kfold_base_dir"]) / config["dataset"]["task"] / f"fold{fold}"
+    frame = pd.read_csv(directory / f"{split}.csv", keep_default_na=False)
+    if mode in ("fmri", "both"):
+        frame = frame.loc[frame.fmri_dst.ne("")]
+    if mode in ("eeg", "both"):
+        frame = frame.loc[frame.eeg_dst.ne("")]
+    return frame.reset_index(drop=True)
+
+
+def smoke_subset(frame):
+    frame = frame.copy()
+    frame["_availability"] = frame.fmri_dst.ne("").astype(int) + 2 * frame.eeg_dst.ne("").astype(int)
+    subjects = []
+    for _, group in frame.groupby(["diagnosis_code", "_availability"], sort=True):
+        subjects.extend(group.component_key.drop_duplicates().sort_values().head(2))
+    return frame.loc[frame.component_key.isin(subjects)].drop(columns="_availability").reset_index(drop=True)
+
+
+def make_loader(frame, config, mode, training=False, dfc=False):
+    from datasets.multimodal_dataset_by_path import (
+        MultiModalDatasetCSV, HierarchicalSampler, multimodal_collate_flex,
+    )
+
+    ds = config["dataset"]
+    tr = config["training"]
+    dataset = MultiModalDatasetCSV(frame, scales=ds["scales"],
+        mode="both" if mode == "all" else mode, use_paired_windows=dfc,
+        dfc_inventory=ds.get("dfc_inventory"),
+        dfc_cache_dir=ds.get("dfc_cache_dir", "Data/dFC44"),
+        dfc_max_windows=1 if config["runtime"]["smoke_steps"] else None)
+    steps = config["runtime"]["smoke_steps"]
+    if steps:
+        dataset.df = smoke_subset(dataset.df.iloc[dataset.index])
+        dataset.index = np.arange(len(dataset.df))
+    frame = dataset.df.iloc[dataset.index].reset_index(drop=True)
+    batch_size = min(tr["batch_size"], 4) if steps else tr["batch_size"]
+    sampler = None
+    if training:
+        sampler = HierarchicalSampler(frame,
+            num_samples=batch_size * steps if steps else None)
+    return DataLoader(dataset, batch_size=batch_size, sampler=sampler, shuffle=False,
+                      num_workers=0 if steps else tr["num_workers"],
+                      collate_fn=multimodal_collate_flex)
+
+
+def binary_metrics(frame):
+    labels = frame.diagnosis_code.to_numpy()
+    probs = frame.probability.to_numpy()
+    if not np.isfinite(probs).all():
+        raise ValueError("Non-finite subject prediction.")
+    pred = (probs >= .5).astype(int)
+    tn, fp, fn, tp = M.confusion_matrix(labels, pred, labels=[0, 1]).ravel()
+    return dict(accuracy=float((pred == labels).mean()),
+                auc=float(roc_auc_score(labels, probs)) if np.unique(labels).size == 2 else None,
+                sensitivity=float(tp / (tp + fn)) if tp + fn else None,
+                specificity=float(tn / (tn + fp)) if tn + fp else None,
+                macro_f1=float(f1_score(labels, pred, average="macro", zero_division=0)),
+                subjects=len(frame))
+
+
+@torch.no_grad()
+def evaluate(model, loader, mode, scales, device):
+    model.eval()
+    rows = []
+    offset = 0
+    for f_data, e_data, labels, f_idx, e_idx, _, _ in loader:
+        if mode == "fmri":
+            logits = model(build_A_list(f_data, scales, device=device))["logits"]
+        elif mode == "eeg":
+            logits = model(build_E_list(e_data, scales, device=device))["logits"]
         else:
-            mask = np.all(np.isfinite(probs), axis=1)
-        mask = mask & np.isfinite(y_true)
-        drop = (~mask).sum()
-        if drop > 0:
-            bad_idx = np.flatnonzero(~mask)[:10].tolist()
-            print(f"[WARN][summarize_val] Drop {drop} rows with NaN in probs/y_true. idx(first10)={bad_idx}")
-        y_true_m = y_true[mask]; probs_m = probs[mask]
-        if y_true_m.size > 0:
-            auc = roc_auc_score(y_true_m, probs_m[:,1] if probs_m.ndim==2 and probs_m.shape[1]==2 else probs_m, 
-                                **({} if probs_m.ndim==1 or probs_m.shape[1]==2 else dict(multi_class='ovr', average='macro')))
-        else:
-            auc = np.nan
-    else:
-        auc = np.nan
-    return dict(accuracy=accuracy, bal_acc=bal_acc, macro_f1=macro_f1, auc=auc, sens=sens, spec=spec)
-
-def log_split_summary(cv, name, idxs, subInfo, labels_np, ds_cfg, logger):
-    """
-    Uniformly count before augmentation for a subset (train/test):
-      - Total N
-      - Overall class distribution
-      - N for each modality (fmri_only / eeg_only / both) and class distribution within modality
-    name: "TRAIN" or "TEST"
-    """
-    idxs = np.asarray(idxs, dtype=int)
-    N = len(idxs)
-    if N == 0:
-        logger.info(f"[FOLD-{cv}] [{name}] EMPTY split.")
-        return
-
-    # ---- Overall class distribution ----
-    vals, cnts = np.unique(labels_np[idxs], return_counts=True)
-    cls_dist = {int(k): int(v) for k, v in zip(vals.tolist(), cnts.tolist())}
-
-    logger.info(f"[FOLD-{cv}] [{name}] base_N={N} | per-class={cls_dist}")
-
-    # ---- Count by modality × class ----
-    mode_cls_counts = defaultdict(lambda: np.zeros(ds_cfg.num_class, dtype=int))
-    for i in idxs:
-        m = infer_mode_from_row(subInfo.iloc[int(i)])
-        if m == "none":
-            continue
-        y = int(labels_np[int(i)])
-        mode_cls_counts[m][y] += 1
-
-    # Fixed order for stable output
-    for m in ["fmri_only", "eeg_only", "both"]:
-        if m in mode_cls_counts:
-            arr = mode_cls_counts[m]
-            total_m = int(arr.sum())
-            # arr.tolist() is like [nc_count, ad_count] (if num_class=2)
-            logger.info(
-                f"[FOLD-{cv}] [{name}] mode={m:9s} | total={total_m:3d} | per-class={arr.tolist()}"
-            )
-
-    # If there are other rare modalities (e.g., future modes), print them as well
-    other_modes = [m for m in mode_cls_counts.keys() if m not in {"fmri_only", "eeg_only", "both"}]
-    for m in other_modes:
-        arr = mode_cls_counts[m]
-        total_m = int(arr.sum())
-        logger.info(
-            f"[FOLD-{cv}] [{name}] mode={m:9s} | total={total_m:3d} | per-class={arr.tolist()}"
-        )
-
-def _ensure_dir(path_str):
-    Path(path_str).mkdir(parents=True, exist_ok=True)
-
-# ==============================
-# Adversarial noise training: noise injection functions
-# ==============================
-def inject_fmri_noise(fmri_scales: List[torch.Tensor], 
-                     corruption_rate: float = 0.3,
-                     roi_dropout_rate: float = 0.3,
-                     block_mask_size: int = 10,
-                     block_mask_prob: float = 0.5,
-                     generator=None) -> List[torch.Tensor]:
-    """
-    Inject noise/masking into fMRI data
-    
-    Args:
-        fmri_scales: List[torch.Tensor], each element is [B, N, N] fMRI connectivity matrix
-        corruption_rate: Corruption sample ratio (0-1)
-        roi_dropout_rate: ROI dropout ratio (0-1)
-        block_mask_size: Block mask size
-        block_mask_prob: Block mask probability
-        generator: Random number generator
-    
-    Returns:
-        corrupted_fmri_scales: Corrupted fMRI data list
-        corruption_mask: [B] Boolean tensor, True indicates the sample is corrupted
-    """
-    if len(fmri_scales) == 0 or fmri_scales[0] is None:
-        return fmri_scales, torch.zeros((), dtype=torch.bool, device='cpu')
-    
-    B = fmri_scales[0].shape[0]
-    device = fmri_scales[0].device
-    
-    # Randomly select samples to corrupt
-    rng = np.random.default_rng()
-    
-    n_corrupt = int(B * corruption_rate)
-    corrupt_indices = rng.choice(B, size=n_corrupt, replace=False)
-    corruption_mask = torch.zeros(B, dtype=torch.bool, device=device)
-    corruption_mask[corrupt_indices] = True
-    
-    corrupted_scales = []
-    for scale_mat in fmri_scales:
-        if scale_mat is None:
-            corrupted_scales.append(None)
-            continue
-        
-        corrupted = scale_mat.clone()
-        
-        # Apply noise to corrupted samples
-        for b_idx in corrupt_indices:
-            mat = corrupted[b_idx]  # [N, N]
-            N = mat.shape[0]
-            
-            # Strategy 1: ROI dropout (randomly zero out rows and columns of some ROIs)
-            if roi_dropout_rate > 0:
-                n_drop = max(1, int(N * roi_dropout_rate))
-                roi_indices = rng.choice(N, size=n_drop, replace=False)
-                mat[roi_indices, :] = 0
-                mat[:, roi_indices] = 0
-            
-            # Strategy 2: Block masking (randomly mask square regions)
-            if block_mask_prob > 0 and rng.random() < block_mask_prob:
-                block_size = min(block_mask_size, N // 2)
-                if block_size > 0:
-                    start_i = rng.integers(0, max(1, N - block_size))
-                    start_j = rng.integers(0, max(1, N - block_size))
-                    end_i = min(start_i + block_size, N)
-                    end_j = min(start_j + block_size, N)
-                    mat[start_i:end_i, start_j:end_j] = 0
-        
-        corrupted_scales.append(corrupted)
-    
-    return corrupted_scales, corruption_mask
+            logits = model(build_A_list(f_data, scales, device=device),
+                           build_E_list(e_data, scales, device=device))["fused_logits"]
+        probs = logits.softmax(-1)[:, 1].cpu().numpy()
+        meta = loader.dataset.df.iloc[loader.dataset.index[offset:offset + len(labels)]]
+        for row, probability in zip(meta.itertuples(), probs):
+            rows.append(dict(component_key=row.component_key, dataset=row.dataset,
+                             diagnosis_code=int(row.diagnosis_code), probability=float(probability)))
+        offset += len(labels)
+    records = pd.DataFrame(rows)
+    if records.empty:
+        raise ValueError(f"No {mode} evaluation records.")
+    if (records.groupby("component_key").diagnosis_code.nunique() != 1).any():
+        raise ValueError("Conflicting labels within an evaluation subject.")
+    subjects = records.groupby(["component_key", "dataset", "diagnosis_code"], as_index=False).probability.mean()
+    return binary_metrics(subjects), subjects
 
 
-def inject_eeg_noise(eeg_scales: List[Dict[str, torch.Tensor]],
-                     corruption_rate: float = 0.3,
-                     channel_dropout_rate: float = 0.3,
-                     noise_scale: float = 2.0,
-                     generator=None) -> List[Dict[str, torch.Tensor]]:
-    """
-    Inject noise/masking into EEG data
-    
-    Args:
-        eeg_scales: List[Dict[str, torch.Tensor]], each element is {band: [B, N, N]} dictionary
-        corruption_rate: Corruption sample ratio (0-1)
-        channel_dropout_rate: Channel dropout ratio (0-1)
-        noise_scale: 1/f noise strength
-        generator: Random number generator
-    
-    Returns:
-        corrupted_eeg_scales: Corrupted EEG data list
-        corruption_mask: [B] Boolean tensor, True indicates the sample is corrupted
-    """
-    if len(eeg_scales) == 0 or eeg_scales[0] is None:
-        return eeg_scales, torch.zeros((), dtype=torch.bool, device='cpu')
-    
-    # Get B and device from first non-None scale
-    B, device = None, None
-    for scale_dict in eeg_scales:
-        if scale_dict is not None:
-            for band_tensor in scale_dict.values():
-                if band_tensor is not None:
-                    B = band_tensor.shape[0]
-                    device = band_tensor.device
-                    break
-            if B is not None:
-                break
-    
-    if B is None:
-        return eeg_scales, torch.zeros((), dtype=torch.bool, device='cpu')
-    
-    # Randomly select samples to corrupt
-    rng = np.random.default_rng()
-    
-    n_corrupt = int(B * corruption_rate)
-    corrupt_indices = rng.choice(B, size=n_corrupt, replace=False)
-    corruption_mask = torch.zeros(B, dtype=torch.bool, device=device)
-    corruption_mask[corrupt_indices] = True
-    
-    corrupted_scales = []
-    for scale_dict in eeg_scales:
-        if scale_dict is None:
-            corrupted_scales.append(None)
-            continue
-        
-        corrupted_dict = {}
-        for band, band_tensor in scale_dict.items():
-            if band_tensor is None:
-                corrupted_dict[band] = None
+def load_weights(model, checkpoint, device):
+    saved = torch.load(checkpoint, map_location=device, weights_only=False)
+    model.load_state_dict(saved["model_state_dict"], strict=True)
+    return saved
+
+
+def fit(model, train_loader, valid_loaders, models_to_save, loss_fn, config, root, fold, stage):
+    """One shared epoch loop; stages define their own objective and saved branches."""
+    task = config["dataset"]["task"]
+    directory = run_directory(root, task, fold)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "bestmodel").mkdir(exist_ok=True)
+    with open(directory / "config.yaml", "w") as handle:
+        yaml.safe_dump({**config, "dataset": {**config["dataset"], "fold": fold}},
+                       handle, sort_keys=False)
+    logger = setup_logger(str(directory / "train.log"))
+    optimizer = torch.optim.Adam((p for p in model.parameters() if p.requires_grad),
+        lr=config["training"]["lr"], weight_decay=config["training"]["weight_decay"])
+    epochs = 1 if config["runtime"]["smoke_steps"] else config["training"]["epochs"]
+    best = {name: -float("inf") for name in models_to_save}
+    if train_loader.dataset.skipped_records:
+        pd.DataFrame(train_loader.dataset.skipped_records).to_csv(
+            directory / "skipped_dfc_records.csv", index=False)
+        logger.info("Skipped %d zero-variance dFC records", len(train_loader.dataset.skipped_records))
+    history = []
+    run_name = "_".join(models_to_save)
+    logger.info("Stage=%s branches=%s train_subjects=%d train_records=%d smoke_steps=%d",
+                stage, run_name, train_loader.dataset.df.component_key.nunique(),
+                len(train_loader.dataset), config["runtime"]["smoke_steps"])
+    for epoch in range(epochs):
+        model.train()
+        train_loader.sampler.set_epoch(epoch)
+        total_loss = 0.
+        paired_count = 0
+        for batch in train_loader:
+            optimizer.zero_grad(set_to_none=True)
+            loss, paired = loss_fn(batch)
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"Stage {stage} epoch {epoch}: non-finite loss.")
+            loss.backward()
+            optimizer.step()
+            total_loss += float(loss.detach())
+            paired_count += paired
+        record = dict(stage=stage, branches=run_name, epoch=epoch + 1, train_loss=total_loss / len(train_loader),
+                      paired_samples=paired_count)
+        for name, branch in models_to_save.items():
+            values, _ = evaluate(branch, valid_loaders[name], name,
+                                 config["dataset"]["scales"], config["runtime"]["device"])
+            auc = values["auc"]
+            if auc is None:
+                raise ValueError(f"Validation AUC requires both classes: fold={fold}, modality={name}")
+            record.update({f"val_{name}_{key}": value for key, value in values.items()})
+            if auc > best[name]:
+                best[name] = auc
+                torch.save(dict(model_state_dict=branch.state_dict(), epoch=epoch + 1,
+                    optimizer_state_dict=optimizer.state_dict(), val_auc=auc,
+                    task=task, fold=fold, stage=stage, modality=name),
+                    best_checkpoint(root, task, fold, name))
+        history.append(record)
+        pd.DataFrame(history).to_csv(directory / f"metrics_{run_name}.csv", index=False)
+        logger.info(json.dumps(record))
+    return history
+
+
+def final_evaluation(models, config, root, fold):
+    """Evaluate each best checkpoint once on internal test and external cohorts."""
+    directory = run_directory(root, config["dataset"]["task"], fold)
+    directory.mkdir(parents=True, exist_ok=True)
+    summary = []
+    for mode, model in models.items():
+        load_weights(model, best_checkpoint(root, config["dataset"]["task"], fold, mode),
+                     config["runtime"]["device"])
+        roles = ["test_all"] if mode == "fusion" else [
+            "test_all", "external_Diabete-dementia", "external_P-ADIC"]
+        for role in roles:
+            frame = read_split(config, fold, role, "both" if mode == "fusion" else mode)
+            if frame.empty or frame.diagnosis_code.nunique() != 2:
                 continue
-            
-            corrupted = band_tensor.clone()  # [B, N, N]
-            N = corrupted.shape[1]
-            
-            # Apply noise to corrupted samples
-            for b_idx in corrupt_indices:
-                mat = corrupted[b_idx]  # [N, N]
-                
-                # Strategy 1: Channel masking (randomly zero out rows and columns of some channels)
-                if channel_dropout_rate > 0:
-                    n_drop = max(1, int(N * channel_dropout_rate))
-                    ch_indices = rng.choice(N, size=n_drop, replace=False)
-                    mat[ch_indices, :] = 0
-                    mat[:, ch_indices] = 0
-                
-                # Strategy 2: Strong 1/f noise (add low-frequency noise)
-                if noise_scale > 0:
-                    # Generate 1/f noise (simplified: use low-frequency random noise)
-                    noise = torch.randn_like(mat) * noise_scale
-                    # Low-pass filter the noise (simplified: simulate with average pooling)
-                    kernel_size = max(3, N // 10)
-                    if kernel_size > 1 and N > kernel_size:
-                        noise_2d = noise.unsqueeze(0).unsqueeze(0)  # [1, 1, N, N]
-                        noise_pooled = F.avg_pool2d(
-                            noise_2d,
-                            kernel_size=kernel_size,
-                            stride=1,
-                            padding=kernel_size // 2
-                        ).squeeze(0).squeeze(0)  # [N', N']
-                        # Crop or pad to original size
-                        if noise_pooled.shape[0] != N:
-                            if noise_pooled.shape[0] > N:
-                                noise_pooled = noise_pooled[:N, :N]
-                            else:
-                                # Pad (simple edge replication)
-                                pad_h = N - noise_pooled.shape[0]
-                                pad_w = N - noise_pooled.shape[1]
-                                noise_pooled = F.pad(noise_pooled, (0, pad_w, 0, pad_h), mode='replicate')
-                        noise = noise_pooled
-                    mat = mat + noise
-            
-            corrupted_dict[band] = corrupted
-        
-        corrupted_scales.append(corrupted_dict)
-    
-    return corrupted_scales, corruption_mask
+            loader = make_loader(frame, config, "both" if mode == "fusion" else mode)
+            values, subjects = evaluate(model, loader, mode, config["dataset"]["scales"],
+                                         config["runtime"]["device"])
+            subjects.to_csv(directory / f"predictions_{mode}_{role}.csv", index=False)
+            summary.append(dict(fold=fold, modality=mode, split=role, **values))
+    pd.DataFrame(summary).to_csv(directory / "evaluation.csv", index=False)
+    return summary
 
 
-def compute_entropy_regularization(msre_distribution: torch.Tensor,
-                                   corruption_mask: torch.Tensor,
-                                   clean_entropy_weight: float = 1.0,
-                                   corrupt_entropy_weight: float = 1.0) -> torch.Tensor:
-    """
-    Compute entropy regularization: minimize entropy for clean samples (encourage high confidence),
-    maximize entropy for corrupted samples (encourage low confidence)
-    
-    Args:
-        msre_distribution: [B, num_class] MSRE distribution (probability distribution after softmax)
-        corruption_mask: [B] Boolean tensor, True indicates the sample is corrupted
-        clean_entropy_weight: Entropy weight for clean samples (minimize entropy)
-        corrupt_entropy_weight: Entropy weight for corrupted samples (maximize entropy)
-    
-    Returns:
-        entropy_reg: Scalar, entropy regularization loss
-    """
-    # Compute entropy for each sample: H(p) = -sum(p * log(p))
-    eps = 1e-8
-    entropy = -(msre_distribution * torch.log(msre_distribution + eps)).sum(dim=1)  # [B]
-    
-    # Separate clean and corrupted samples
-    clean_mask = ~corruption_mask
-    corrupt_mask = corruption_mask
-    
-    entropy_reg = torch.zeros((), device=msre_distribution.device, dtype=torch.float32)
-    
-    # Clean samples: minimize entropy (encourage high confidence)
-    if clean_mask.any():
-        clean_entropy = entropy[clean_mask].mean()
-        entropy_reg = entropy_reg + clean_entropy_weight * clean_entropy
-    
-    # Corrupted samples: maximize entropy (encourage low confidence) = minimize negative entropy
-    if corrupt_mask.any():
-        corrupt_entropy = entropy[corrupt_mask].mean()
-        # Maximum entropy = log(num_class), we encourage approaching maximum entropy
-        max_entropy = np.log(msre_distribution.shape[1])
-        # Directly minimize negative entropy (i.e., maximize entropy): entropy_reg += -corrupt_entropy_weight * corrupt_entropy
-        # This way when corrupt_entropy is small, gradient will be large, effectively pushing entropy to increase
-        entropy_reg = entropy_reg - corrupt_entropy_weight * corrupt_entropy
-    
-    return entropy_reg
-
-
-def compute_msre_sensitive_metrics(msre_distribution: torch.Tensor,
-                                   corruption_mask: torch.Tensor = None) -> Dict[str, torch.Tensor]:
-    """
-    Compute MSRE sensitive metrics (entropy, margin, logit gap, etc.) for more accurate observation of MSRE changes
-    
-    Args:
-        msre_distribution: [B, num_class] MSRE distribution (probability distribution after softmax)
-        corruption_mask: [B] Boolean tensor, True indicates the sample is corrupted (optional)
-    
-    Returns:
-        metrics: Dictionary containing:
-            - entropy: [B] Entropy for each sample
-            - entropy_mean: Scalar tensor, average entropy
-            - entropy_clean: Scalar tensor, average entropy for clean samples (if mask provided)
-            - entropy_corrupt: Scalar tensor, average entropy for corrupted samples (if mask provided)
-            - max_prob: [B] Maximum probability for each sample
-            - max_prob_mean: Scalar tensor, average maximum probability
-            - margin: [B] Margin for each sample (max probability - second max probability)
-            - margin_mean: Scalar tensor, average margin
-    """
-    eps = 1e-8
-    B, num_class = msre_distribution.shape
-    
-    # Compute entropy
-    entropy = -(msre_distribution * torch.log(msre_distribution + eps)).sum(dim=1)  # [B]
-    entropy_mean = entropy.mean()
-    
-    # Compute maximum probability
-    max_prob, _ = msre_distribution.max(dim=1)  # [B]
-    max_prob_mean = max_prob.mean()
-    
-    # Compute margin (max probability - second max probability)
-    sorted_probs, _ = torch.sort(msre_distribution, dim=1, descending=True)
-    margin = sorted_probs[:, 0] - sorted_probs[:, 1]  # [B]
-    margin_mean = margin.mean()
-    
-    metrics = {
-        "entropy": entropy,
-        "entropy_mean": entropy_mean,
-        "max_prob": max_prob,
-        "max_prob_mean": max_prob_mean,
-        "margin": margin,
-        "margin_mean": margin_mean,
-    }
-    
-    # If corruption_mask provided, compute metrics separately for clean and corrupted samples
-    if corruption_mask is not None:
-        clean_mask = ~corruption_mask
-        corrupt_mask = corruption_mask
-        
-        if clean_mask.any():
-            metrics["entropy_clean"] = entropy[clean_mask].mean()
-            metrics["max_prob_clean"] = max_prob[clean_mask].mean()
-            metrics["margin_clean"] = margin[clean_mask].mean()
-        
-        if corrupt_mask.any():
-            metrics["entropy_corrupt"] = entropy[corrupt_mask].mean()
-            metrics["max_prob_corrupt"] = max_prob[corrupt_mask].mean()
-            metrics["margin_corrupt"] = margin[corrupt_mask].mean()
-    
-    return metrics
+def summarize_folds(root, task, folds):
+    frames = [pd.read_csv(run_directory(root, task, f) / "evaluation.csv") for f in folds]
+    records = pd.concat(frames, ignore_index=True)
+    records.to_csv(Path(root) / task / "evaluation_by_fold.csv", index=False)
+    metrics = ["accuracy", "auc", "sensitivity", "specificity", "macro_f1"]
+    summary = records.groupby(["modality", "split"])[metrics].agg(["mean", "std"])
+    summary.to_csv(Path(root) / task / "evaluation_summary.csv")
+    print(summary.to_string())

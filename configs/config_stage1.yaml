@@ -1,33 +1,20 @@
-# config_stage1.yaml - Stage1: Single-Modal Warmup
 dataset:
-  # 5-fold cross validation data directory
-  # Each fold should contain: train_eeg_only.csv, train_fmri_only.csv, val_eeg_only.csv, val_fmri_only.csv
-  kfold_base_dir: Data/Data_all_AD/New-split/Splits_cv5
-  scales: [100,200,300,400,500]
+  kfold_base_dir: Data/PaperSplits
+  task: AD-NC
+  fold: null
+  scales:
+  - 100
+  - 200
+  - 300
+  - 400
+  - 500
   layers: 5
   num_class: 2
-
 training:
-  # ===== Task and fusion =====
-  fusion_mode: "bcmf"  # Bidirectional Cross-Modal Fusion (formerly "dual_cross")
-  use_msre: false  # Stage1 does not use MSRE
-  
-  # ===== Training hyperparameters =====
-  batch_size: 30
-  epochs: 50  # Stage1 epochs (corresponding to warmup_epochs_single)
+  batch_size: 32
+  epochs: 50
   lr: 0.001
-  weight_decay: 0.01
-  num_workers: 4
-  eval_interval: 5
-  
-  # ===== Class imbalance and sampling =====
-  imbalance_loss: true
-  
-  # ===== Model saving =====
-  min_epochs_before_saving: 20
-  use_tqdm: true
-
+  weight_decay: 0.001
+  num_workers: 0
 logging:
-  result_dir: "results/Stage1"
-  tensorboard: true
-
+  result_dir: results/Stage1
